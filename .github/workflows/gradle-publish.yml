@@ -24,6 +24,8 @@ jobs:
 
     - name: Setup Android SDK
       uses: android-actions/setup-android@v3
+      with:
+        packages: ''
 
     - name: Grant execute permission to gradlew
       run: chmod +x ./gradlew

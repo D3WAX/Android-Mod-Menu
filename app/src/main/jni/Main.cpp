@@ -26,6 +26,9 @@ bool logExec = false;          // featNum 3 (recon: log lines passed to ExecuteC
 int runRequest = 0;            // 0 = none, 1 = run menu text (featNum 2), 2 = run cmd.txt (featNum 4)
 std::string cmdText;           // featNum 1
 std::mutex cmdMtx;
+volatile int tickCalls = 0;    // how many times the game called our Tick hook (0 = hook never fires)
+
+void FLog(const char *msg);    // defined below
 
 // ---------------------------------------------------------------------------
 // Menu
@@ -62,22 +65,37 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featN
             if (text != nullptr) {
                 const char *s = env->GetStringUTFChars(text, 0);
                 if (s) {
-                    std::lock_guard<std::mutex> lk(cmdMtx);
-                    cmdText = s;
+                    int len;
+                    {
+                        std::lock_guard<std::mutex> lk(cmdMtx);
+                        cmdText = s;
+                        len = (int) cmdText.size();
+                    }
                     env->ReleaseStringUTFChars(text, s);
+                    char b[96];
+                    snprintf(b, sizeof b, "menu: text set, len=%d", len);
+                    FLog(b);
                 }
             }
             break;
         }
-        case 2:
+        case 2: {
             runRequest = 1;
+            char b[96];
+            snprintf(b, sizeof b, "menu: Run pressed, tickCalls=%d", (int) tickCalls);
+            FLog(b);
             break;
+        }
         case 3:
             logExec = boolean;
             break;
-        case 4:
+        case 4: {
             runRequest = 2;
+            char b[96];
+            snprintf(b, sizeof b, "menu: Run cmd.txt pressed, tickCalls=%d", (int) tickCalls);
+            FLog(b);
             break;
+        }
     }
 }
 
@@ -121,8 +139,12 @@ void LogLines(void *arr) {
     if (!arr) return;
     uintptr_t n = *(uintptr_t *) ((uintptr_t) arr + 0x18);
     void **items = (void **) ((uintptr_t) arr + 0x20);
-    for (uintptr_t i = 0; i < n && i < 64; i++)
-        LOGI(OBFUSCATE("ExecuteCmd line[%d] = %s"), (int) i, Il2CppStr(items[i]).c_str());
+    for (uintptr_t i = 0; i < n && i < 64; i++) {
+        std::string line = Il2CppStr(items[i]);
+        LOGI(OBFUSCATE("ExecuteCmd line[%d] = %s"), (int) i, line.c_str());
+        std::string out = "ExecuteCmd line[" + std::to_string(i) + "] = " + line;
+        FLog(out.c_str());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +220,10 @@ void RunCommand(void *box, const std::vector<std::string> &lines) {
     }
     if (!p_string_new || !p_array_new || !g_stringClass || !old_ExecuteCmd) {
         LOGE(OBFUSCATE("il2cpp API not ready"));
+        char b[200];
+        snprintf(b, sizeof b, "RunCommand: API not ready string_new=%p array_new=%p stringClass=%p execCmd=%p",
+                 (void *) p_string_new, (void *) p_array_new, g_stringClass, (void *) old_ExecuteCmd);
+        FLog(b);
         return;
     }
     if (lines.empty()) return;
@@ -212,6 +238,7 @@ void RunCommand(void *box, const std::vector<std::string> &lines) {
 void (*old_Tick)(void *self, void *method);
 
 void Tick_hook(void *self, void *method) {
+    tickCalls = tickCalls + 1;
     if (self != nullptr && runRequest != 0) {
         int req = runRequest;
         runRequest = 0;
@@ -224,7 +251,11 @@ void Tick_hook(void *self, void *method) {
         }
         std::vector<std::string> lines = SplitLines(text);
         LOGI(OBFUSCATE("Running %d line(s)"), (int) lines.size());
+        char b[120];
+        snprintf(b, sizeof b, "Tick: running %d line(s) on box=%p", (int) lines.size(), self);
+        FLog(b);
         RunCommand(self, lines);
+        FLog("Tick: RunCommand returned");
     }
     return old_Tick(self, method);
 }

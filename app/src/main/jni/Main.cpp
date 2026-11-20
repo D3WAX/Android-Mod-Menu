@@ -26,7 +26,9 @@ bool logExec = false;          // featNum 3 (recon: log lines passed to ExecuteC
 int runRequest = 0;            // 0 = none, 1 = run menu text (featNum 2), 2 = run cmd.txt (featNum 4)
 std::string cmdText;           // featNum 1
 std::mutex cmdMtx;
-volatile int tickCalls = 0;    // how many times the game called our Tick hook (0 = hook never fires)
+volatile int tickCalls = 0;    // how many times the game called our Tick hook (loop-mode boxes only?)
+volatile int runnerCalls = 0;  // how many times EditorTriggerBoxRunner.Update ran (runs every frame)
+void *g_box = nullptr;         // some live EditorTriggerBox (captured from Runner.Add / Tick)
 
 void FLog(const char *msg);    // defined below
 
@@ -82,7 +84,7 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featN
         case 2: {
             runRequest = 1;
             char b[96];
-            snprintf(b, sizeof b, "menu: Run pressed, tickCalls=%d", (int) tickCalls);
+            snprintf(b, sizeof b, "menu: Run pressed, tick=%d runner=%d box=%p", (int) tickCalls, (int) runnerCalls, g_box);
             FLog(b);
             break;
         }
@@ -92,7 +94,7 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featN
         case 4: {
             runRequest = 2;
             char b[96];
-            snprintf(b, sizeof b, "menu: Run cmd.txt pressed, tickCalls=%d", (int) tickCalls);
+            snprintf(b, sizeof b, "menu: Run cmd.txt pressed, tick=%d runner=%d box=%p", (int) tickCalls, (int) runnerCalls, g_box);
             FLog(b);
             break;
         }
@@ -234,30 +236,63 @@ void RunCommand(void *box, const std::vector<std::string> &lines) {
     old_ExecuteCmd(box, arr, nullptr); // call the original directly so it is not logged
 }
 
-// EditorTriggerBox$$Tick(), RVA 0x1166344: runs every frame per box on the main thread
+// Runs a pending request (from the menu) on the Unity main thread.
+void ProcessPending(void *box) {
+    int req = runRequest;
+    if (req == 0) return;
+    runRequest = 0;
+    if (!box) {
+        FLog("run: no triggerbox instance known yet -> place one triggerbox in the world first");
+        return;
+    }
+    std::string text;
+    if (req == 1) {
+        std::lock_guard<std::mutex> lk(cmdMtx);
+        text = cmdText;
+    } else {
+        text = ReadCmdFile();
+    }
+    std::vector<std::string> lines = SplitLines(text);
+    char b[120];
+    snprintf(b, sizeof b, "run: %d line(s) on box=%p", (int) lines.size(), box);
+    FLog(b);
+    RunCommand(box, lines);
+    FLog("run: RunCommand returned");
+}
+
+// EditorTriggerBox$$Tick(), RVA 0x1166344 (only called for some boxes, e.g. loop mode)
 void (*old_Tick)(void *self, void *method);
 
 void Tick_hook(void *self, void *method) {
     tickCalls = tickCalls + 1;
-    if (self != nullptr && runRequest != 0) {
-        int req = runRequest;
-        runRequest = 0;
-        std::string text;
-        if (req == 1) {
-            std::lock_guard<std::mutex> lk(cmdMtx);
-            text = cmdText;
-        } else {
-            text = ReadCmdFile();
-        }
-        std::vector<std::string> lines = SplitLines(text);
-        LOGI(OBFUSCATE("Running %d line(s)"), (int) lines.size());
-        char b[120];
-        snprintf(b, sizeof b, "Tick: running %d line(s) on box=%p", (int) lines.size(), self);
-        FLog(b);
-        RunCommand(self, lines);
-        FLog("Tick: RunCommand returned");
-    }
+    if (self != nullptr) g_box = self;
+    ProcessPending(self);
     return old_Tick(self, method);
+}
+
+// EditorTriggerBoxRunner$$Add(EditorTriggerBox), RVA 0xFCE4CC (static): remember a live box
+void (*old_RunnerAdd)(void *box, void *method);
+
+void RunnerAdd_hook(void *box, void *method) {
+    if (box != nullptr) g_box = box;
+    return old_RunnerAdd(box, method);
+}
+
+// EditorTriggerBoxRunner$$Remove(EditorTriggerBox), RVA 0xFCE69C (static): forget it if destroyed
+void (*old_RunnerRemove)(void *box, void *method);
+
+void RunnerRemove_hook(void *box, void *method) {
+    if (box == g_box) g_box = nullptr;
+    return old_RunnerRemove(box, method);
+}
+
+// EditorTriggerBoxRunner$$Update(), RVA 0xFCE87C: runs every frame on the main thread
+void (*old_RunnerUpdate)(void *self, void *method);
+
+void RunnerUpdate_hook(void *self, void *method) {
+    runnerCalls = runnerCalls + 1;
+    ProcessPending(g_box);
+    return old_RunnerUpdate(self, method);
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +335,12 @@ void *hack_thread(void *) {
     FLog("hook ExecuteCmd ok");
     HOOK(targetLibName, str2Offset(OBFUSCATE("0x1166344")), Tick_hook, old_Tick);
     FLog("hook Tick ok");
+    HOOK(targetLibName, str2Offset(OBFUSCATE("0xFCE4CC")), RunnerAdd_hook, old_RunnerAdd);
+    FLog("hook Runner.Add ok");
+    HOOK(targetLibName, str2Offset(OBFUSCATE("0xFCE69C")), RunnerRemove_hook, old_RunnerRemove);
+    FLog("hook Runner.Remove ok");
+    HOOK(targetLibName, str2Offset(OBFUSCATE("0xFCE87C")), RunnerUpdate_hook, old_RunnerUpdate);
+    FLog("hook Runner.Update ok");
 
 #elif defined(__arm__)
     // Nothing for armv7 (RVAs are for the arm64 libil2cpp.so)

@@ -1,6 +1,7 @@
 #include <list>
 #include <vector>
 #include <cstring>
+#include <cstdio>
 #include <pthread.h>
 #include <thread>
 #include <string>
@@ -90,7 +91,19 @@ typedef void *(*il2cpp_class_from_name_t)(void *image, const char *ns, const cha
 
 il2cpp_string_new_t      p_string_new = nullptr;
 il2cpp_array_new_t       p_array_new = nullptr;
-void *                   g_stringClass = nullptr;
+il2cpp_get_corlib_t      p_get_corlib = nullptr;
+il2cpp_class_from_name_t p_class_from_name = nullptr;
+void *                   g_stringClass = nullptr; // resolved lazily, see RunCommand
+
+// Breadcrumb log to a file (readable without a PC). Shows how far startup got before a crash.
+#define MOD_LOG_FILE "/sdcard/Android/data/com.MA.LAC/files/mod_log.txt"
+void FLog(const char *msg) {
+    FILE *f = fopen(MOD_LOG_FILE, "a");
+    if (f) {
+        fprintf(f, "%s\n", msg);
+        fclose(f);
+    }
+}
 
 // Il2CppString layout (64-bit): klass(8) monitor(8) length(int @0x10) chars(UTF-16 @0x14)
 std::string Il2CppStr(void *s) {
@@ -177,6 +190,12 @@ std::string ReadCmdFile() {
 // Build a string[] (one element per line) and run it through the game's own ExecuteCmd.
 // Must be called on the Unity main thread (we do it from the Tick hook).
 void RunCommand(void *box, const std::vector<std::string> &lines) {
+    // Resolve System.String only now: il2cpp is fully initialised by the time the user presses Run.
+    // (Doing it at startup crashes: the corlib image does not exist yet.)
+    if (!g_stringClass && p_get_corlib && p_class_from_name) {
+        void *corlib = p_get_corlib();
+        if (corlib) g_stringClass = p_class_from_name(corlib, "System", "String");
+    }
     if (!p_string_new || !p_array_new || !g_stringClass || !old_ExecuteCmd) {
         LOGE(OBFUSCATE("il2cpp API not ready"));
         return;
@@ -228,28 +247,34 @@ void *hack_thread(void *) {
     LOGI(OBFUSCATE("%s has been loaded"), (const char *) targetLibName);
 
 #if defined(__aarch64__)
-    // Resolve il2cpp API by name
+    FLog("---- hack_thread: libil2cpp.so found");
+
+    // Resolve il2cpp API function pointers by name (only dlsym here; do NOT call them yet)
     void *h = dlopen(targetLibName, RTLD_NOW);
     if (h) {
         p_string_new = (il2cpp_string_new_t) dlsym(h, "il2cpp_string_new");
         p_array_new = (il2cpp_array_new_t) dlsym(h, "il2cpp_array_new");
-        il2cpp_get_corlib_t get_corlib = (il2cpp_get_corlib_t) dlsym(h, "il2cpp_get_corlib");
-        il2cpp_class_from_name_t class_from_name = (il2cpp_class_from_name_t) dlsym(h, "il2cpp_class_from_name");
-        if (get_corlib && class_from_name)
-            g_stringClass = class_from_name(get_corlib(), "System", "String");
+        p_get_corlib = (il2cpp_get_corlib_t) dlsym(h, "il2cpp_get_corlib");
+        p_class_from_name = (il2cpp_class_from_name_t) dlsym(h, "il2cpp_class_from_name");
     }
-    LOGI(OBFUSCATE("il2cpp api: string_new=%p array_new=%p stringClass=%p"),
-         (void *) p_string_new, (void *) p_array_new, g_stringClass);
+    char buf[160];
+    snprintf(buf, sizeof buf, "api: string_new=%p array_new=%p corlib=%p class_from_name=%p",
+             (void *) p_string_new, (void *) p_array_new, (void *) p_get_corlib, (void *) p_class_from_name);
+    FLog(buf);
 
     // Il2Cpp: RVA offsets from dump.cs
     HOOK(targetLibName, str2Offset(OBFUSCATE("0x113B130")), NpcDamage, old_NpcDamage);
+    FLog("hook NpcDamage ok");
     HOOK(targetLibName, str2Offset(OBFUSCATE("0x11697D8")), ExecuteCmd_hook, old_ExecuteCmd);
+    FLog("hook ExecuteCmd ok");
     HOOK(targetLibName, str2Offset(OBFUSCATE("0x1166344")), Tick_hook, old_Tick);
+    FLog("hook Tick ok");
 
 #elif defined(__arm__)
     // Nothing for armv7 (RVAs are for the arm64 libil2cpp.so)
 #endif
 
+    FLog("done");
     LOGI(OBFUSCATE("Done"));
     return nullptr;
 }
